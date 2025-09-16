@@ -1,0 +1,146 @@
+name: Build and Test
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  release:
+    types:
+      - created
+
+env:
+  SUPPORTED_GHIDRA_VERSION_RANGE: '^11' # semver range
+
+jobs:
+  prepare:
+    name: Prepare Ghidra Version Matrix
+    outputs:
+      ghidra_versions: ${{ steps.ghidra-versions.outputs.result }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install --no-save 'semver@^7.7.2'
+
+      - name: Collect Ghidra Versions
+        id: ghidra-versions
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const semver = require('semver');
+            const versionRange = semver.validRange(process.env.SUPPORTED_GHIDRA_VERSION_RANGE);
+            if (!versionRange) {
+              throw new Error(`Invalid semver range: ${process.env.SUPPORTED_GHIDRA_VERSION_RANGE}`);
+            }
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: 'NationalSecurityAgency',
+              repo: 'ghidra',
+              per_page: 100
+            });
+            return releases
+              .map(release => ({
+                version: semver.coerce(release.tag_name.replace(/^ghidra_([0-9.]+)_build/is, '$1')).version || null,
+                url: release.assets.find(
+                  asset => /^ghidra_[0-9.]+_PUBLIC_[0-9]+.zip$/is.test(asset.name)
+                )?.browser_download_url || null
+              }))
+              .filter(x => x.url && x.version && semver.satisfies(x.version, versionRange))
+              .sort((a, b) => semver.compare(a.version, b.version));
+  
+  build:
+    runs-on: ubuntu-latest
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        ghidra: ${{ fromJson(needs.prepare.outputs.ghidra_versions) }}
+    permissions:
+      checks: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Ghidra cache
+        id: cache-ghidra
+        uses: actions/cache@v3
+        with:
+          path: ghidra
+          key: ghidra-${{ matrix.ghidra.version }}
+      
+      - name: Download and extract Ghidra
+        if: steps.cache-ghidra.outputs.cache-hit != 'true'
+        run: |
+          wget -O '${{ runner.temp }}/ghidra.zip' '${{ matrix.ghidra.url }}'
+          unzip -q '${{ runner.temp }}/ghidra.zip' -d ghidra
+          rm '${{ runner.temp }}/ghidra.zip'
+          mv ghidra/ghidra_*/* ghidra/
+          rm -rf ghidra/ghidra_*
+
+      - name: Set GHIDRA_INSTALL_DIR
+        run: echo "GHIDRA_INSTALL_DIR=$(pwd)/ghidra" >> "${GITHUB_ENV}"
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '*'
+          check-latest: true
+          cache: 'gradle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: current
+
+      - name: Build Extension
+        working-directory: GolangAnalyzerExtension
+        run: gradle --parallel buildExtension
+
+      - name: Upload Extension Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GolangAnalyzerExtension-${{ matrix.ghidra.version }}.zip
+          path: GolangAnalyzerExtension/dist/*.zip
+      
+      - name: Attach Extension to Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          RELEASE_ID: ${{ github.event.release.id }}
+        run: gh release upload "$RELEASE_ID" "GolangAnalyzerExtension/dist/*.zip" --clobber
+
+      - name: Run Unit Tests
+        id: run-tests
+        if: github.event_name != 'release'
+        working-directory: GolangAnalyzerExtension
+        run: gradle --parallel test
+
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v5
+        if: always() && steps.run-tests.outcome != 'skipped'
+        with:
+          report_paths: GolangAnalyzerExtension/build/test-results/test/TEST-*.xml
+          test_files_prefix: 'GolangAnalyzerExtension/'
+          comment: true
+          check_name: 'JUnit Test Report - ${{ matrix.ghidra.version }}'
+
+      - name: Upload Report Artifacts
+        if: always() && steps.run-tests.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Test Reports - ${{ matrix.ghidra.version }}
+          path: |
+            GolangAnalyzerExtension/build/test-results/test/*.xml
+            GolangAnalyzerExtension/build/reports
